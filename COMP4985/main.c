@@ -6,14 +6,67 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <ncurses.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <stdint.h>
+#include <time.h>
 
 #define MAX_CLIENTS 100
-#define BUFFER_SIZE 1024
-#define MAX_LOGS 1000
+#define BUFFER_SIZE 65536
+#define MAX_LOG_SIZE 65535
 
+// Protocol Version
+#define PROTOCOL_MAJOR 0
+#define PROTOCOL_MINOR 1
+
+// Resource Types (5 bits)
+#define RESOURCE_SERVER   0x00
+#define RESOURCE_ACTIVATE 0x01
+#define RESOURCE_ACCOUNT  0x02
+#define RESOURCE_LOG      0x03
+
+// CRUD Operations (2 bits)
+#define CRUD_CREATE  0x00
+#define CRUD_READ    0x01
+#define CRUD_UPDATE  0x02
+#define CRUD_DELETE  0x03
+
+// ACK bit
+#define ACK_REQUEST  0x00
+#define ACK_RESPONSE 0x01
+
+// Global Header (8 bytes)
+typedef struct __attribute__((packed)) {
+    uint8_t  version;
+    uint8_t  msg_type;
+    uint8_t  status;
+    uint8_t  padding;
+    uint32_t msg_length;
+} GlobalHeader;
+
+// Message payloads
+typedef struct __attribute__((packed)) {
+    uint32_t server_ip;     // 4 bytes - server IP
+    uint8_t  server_id;     // 1 byte - server ID
+} RegisterPayload;
+
+typedef struct __attribute__((packed)) {
+    uint32_t server_ip;     // 4 bytes - server IP
+    uint8_t  server_id;     // 1 byte - server ID
+} ActivatePayload;
+
+typedef struct __attribute__((packed)) {
+    char     username[16];  // 16 bytes - username
+    char     password[16];  // 16 bytes - password
+    uint8_t  client_id;     // 1 byte - client ID
+    uint8_t  status;        // 1 byte - status
+} AccountPayload;
+
+typedef struct __attribute__((packed)) {
+    uint8_t  server_id;
+    uint16_t log_length;
+
+} LogPayload;
 
 typedef struct {
     char ip[20];
@@ -21,72 +74,131 @@ typedef struct {
     int my_port;
 } ManagerInfo;
 
-
-WINDOW *log_win, *input_win;
-pthread_mutex_t ui_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t manager_mutex = PTHREAD_MUTEX_INITIALIZER;
 int client_sockets[MAX_CLIENTS] = {0};
 
-// Manager connection info
+
 int manager_connected = 0;
 int manager_socket = -1;
 char manager_ip[20];
 int manager_port;
+uint8_t my_server_id = 0x00;
+uint32_t my_server_ip = 0;
 
-// Log history
-char log_history[MAX_LOGS][256];
-int log_count = 0;
-
-//UI
-void init_interface() {
-    initscr();
-    cbreak();
-    noecho();
-    curs_set(0);
-
-    log_win = newwin(LINES - 3, COLS, 0, 0);
-    input_win = newwin(3, COLS, LINES - 3, 0);
-
-    scrollok(log_win, TRUE);
-    box(log_win, 0, 0);
-    mvwprintw(log_win, 0, 2, " Server Logs ");
-
-    box(input_win, 0, 0);
-    mvwprintw(input_win, 0, 2, " Console Input ");
-
-    wrefresh(log_win);
-    wrefresh(input_win);
+// Helper: Create version byte
+uint8_t make_version(uint8_t major, uint8_t minor) {
+    return ((major & 0x0F) << 4) | (minor & 0x0F);
 }
 
-// --- 2. REDRAW ALL LOGS ---
-void redraw_logs() {
-    pthread_mutex_lock(&ui_mutex);
+// Helper: Create message type byte
+uint8_t make_msg_type(uint8_t resource, uint8_t crud, uint8_t ack) {
+    return ((resource & 0x1F) << 3) | ((crud & 0x03) << 1) | (ack & 0x01);
+}
 
-    wclear(log_win);
-    box(log_win, 0, 0);
-    mvwprintw(log_win, 0, 2, " Server Logs ");
+// Helper: Parse message type
+void parse_msg_type(uint8_t msg_type, uint8_t *resource, uint8_t *crud, uint8_t *ack) {
+    *resource = (msg_type >> 3) & 0x1F;
+    *crud = (msg_type >> 1) & 0x03;
+    *ack = msg_type & 0x01;
+}
 
-    // Display all logs from history
-    int start = (log_count > LINES - 5) ? (log_count - (LINES - 5)) : 0;
-    for (int i = start; i < log_count; i++) {
-        wprintw(log_win, "  %s\n", log_history[i]);
+// Get timestamp string
+void get_timestamp(char *buffer, size_t size) {
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    strftime(buffer, size, "%Y-%m-%d %H:%M:%S", t);
+}
+
+// Binary protocol send function
+int send_binary_msg(int sock, uint8_t resource, uint8_t crud, uint8_t ack,
+                    uint8_t status, const void *payload, uint32_t payload_len) {
+    GlobalHeader header;
+    header.version = make_version(PROTOCOL_MAJOR, PROTOCOL_MINOR);
+    header.msg_type = make_msg_type(resource, crud, ack);
+    header.status = status;
+    header.padding = 0x00;
+    header.msg_length = htonl(payload_len);
+
+    // Send 8-byte header
+    ssize_t sent = send(sock, &header, sizeof(GlobalHeader), MSG_NOSIGNAL);
+    if (sent != sizeof(GlobalHeader)) {
+        return -1;
     }
 
-    wrefresh(log_win);
-    pthread_mutex_unlock(&ui_mutex);
+    // Send payload if exists
+    if (payload_len > 0 && payload != NULL) {
+        sent = send(sock, payload, payload_len, MSG_NOSIGNAL);
+        if (sent != payload_len) {
+            return -1;
+        }
+    }
+
+    return 0;
 }
 
-//Send message to server manager
-void send_to_manager(const char *msg) {
+// Binary protocol receive function
+int recv_binary_msg(int sock, GlobalHeader *header, void *payload, uint32_t max_payload_len) {
+    // Receive exactly 8 bytes for header
+    ssize_t received = recv(sock, header, sizeof(GlobalHeader), MSG_WAITALL);
+    if (received != sizeof(GlobalHeader)) {
+        return -1;
+    }
+
+    // Convert message length from network byte order
+    uint32_t payload_len = ntohl(header->msg_length);
+
+    // Validate payload length
+    if (payload_len > max_payload_len) {
+        return -2;  // Payload too large
+    }
+
+    // Receive payload if present
+    if (payload_len > 0 && payload != NULL) {
+        received = recv(sock, payload, payload_len, MSG_WAITALL);
+        if (received != payload_len) {
+            return -1;
+        }
+    }
+
+    return payload_len;
+}
+
+// Safe logging with timestamp
+void safe_log(const char *msg) {
+    char timestamp[32];
+    get_timestamp(timestamp, sizeof(timestamp));
+
+    pthread_mutex_lock(&log_mutex);
+    printf("[%s] %s\n", timestamp, msg);
+    fflush(stdout);
+    pthread_mutex_unlock(&log_mutex);
+}
+
+// Send log to manager
+void send_log_to_manager(const char *log_msg) {
     pthread_mutex_lock(&manager_mutex);
 
     if (manager_connected && manager_socket >= 0) {
-        char formatted_msg[512];
-        snprintf(formatted_msg, sizeof(formatted_msg), "LOG: %s\n", msg);
+        uint16_t log_len = strlen(log_msg);
 
-        ssize_t sent = send(manager_socket, formatted_msg, strlen(formatted_msg), MSG_NOSIGNAL);
-        if (sent < 0) {
+        // uint16_t max is 65535, so truncate if needed
+        if (strlen(log_msg) > MAX_LOG_SIZE) {
+            log_len = MAX_LOG_SIZE;
+        }
+
+        // Build log payload
+        uint8_t buffer[3 + MAX_LOG_SIZE];
+        LogPayload *log_payload = (LogPayload*)buffer;
+        log_payload->server_id = my_server_id;
+        log_payload->log_length = htons(log_len);
+        memcpy(buffer + 3, log_msg, log_len);
+
+        uint32_t total_len = 3 + log_len;
+
+        if (send_binary_msg(manager_socket, RESOURCE_LOG, CRUD_CREATE, ACK_REQUEST,
+                           0x00, buffer, total_len) < 0) {
             manager_connected = 0;
             close(manager_socket);
             manager_socket = -1;
@@ -96,41 +208,35 @@ void send_to_manager(const char *msg) {
     pthread_mutex_unlock(&manager_mutex);
 }
 
-//history log
-void safe_log(const char *msg) {
-    if (log_count < MAX_LOGS) {
-        strncpy(log_history[log_count], msg, 255);
-        log_history[log_count][255] = '\0';
-        log_count++;
-    } else {
-
-        for (int i = 0; i < MAX_LOGS - 1; i++) {
-            strcpy(log_history[i], log_history[i + 1]);
-        }
-        strncpy(log_history[MAX_LOGS - 1], msg, 255);
-        log_history[MAX_LOGS - 1][255] = '\0';
-    }
-
-
-    redraw_logs();
-
-
-    send_to_manager(msg);
+// Enhanced logging that also sends to manager
+void log_and_forward(const char *msg) {
+    safe_log(msg);
+    send_log_to_manager(msg);
 }
 
-// --- 5. MANAGER CONNECTION MAINTAINER ---
+// Print header details
+void log_header_info(GlobalHeader *header) {
+    uint8_t resource, crud, ack;
+    parse_msg_type(header->msg_type, &resource, &crud, &ack);
+
+    char log_msg[256];
+    sprintf(log_msg, "[HEADER] Ver:0x%02X Type:0x%02X (Res:%d CRUD:%d ACK:%d) Status:0x%02X Len:%u",
+            header->version, header->msg_type, resource, crud, ack,
+            header->status, ntohl(header->msg_length));
+    safe_log(log_msg);
+}
+
+// MANAGER CONNECTION MAINTAINER
 void* manager_connection_thread(void* arg) {
     ManagerInfo* info = (ManagerInfo*)arg;
 
     strcpy(manager_ip, info->ip);
     manager_port = info->port;
-    int my_port = info->my_port;
 
     sleep(1);
 
     safe_log(">>> Attempting to connect to Manager...");
 
-    // Try to connect
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
         safe_log("[ERROR] Socket creation failed");
@@ -152,27 +258,42 @@ void* manager_connection_thread(void* arg) {
         return NULL;
     }
 
+    // Get my own IP for registration
+    struct sockaddr_in my_addr;
+    socklen_t addr_len = sizeof(my_addr);
+    getsockname(sock, (struct sockaddr*)&my_addr, &addr_len);
+    my_server_ip = my_addr.sin_addr.s_addr;
+
     safe_log(">>> IP address converted, attempting connection...");
 
     if (connect(sock, (struct sockaddr *)&mgr_addr, sizeof(mgr_addr)) == 0) {
         safe_log(">>> Connected to Manager!");
 
-        // Send registration
-        char reg_msg[64];
-        sprintf(reg_msg, "REGISTER_SERVER %d\n", my_port);
+        // Send registration message
+        RegisterPayload reg_payload;
 
-        safe_log(">>> Sending registration message...");
+        // Get local IP address
+        struct sockaddr_in local_addr;
+        socklen_t local_len = sizeof(local_addr);
+        if (getsockname(sock, (struct sockaddr*)&local_addr, &local_len) == 0) {
+            reg_payload.server_ip = local_addr.sin_addr.s_addr;
+        } else {
+            reg_payload.server_ip = inet_addr("127.0.0.1");
+        }
 
-        ssize_t sent = send(sock, reg_msg, strlen(reg_msg), 0);
+        reg_payload.server_id = my_server_id;
 
-        if (sent > 0) {
+        safe_log(">>> Sending registration (Protocol v0.1, 8-byte header)...");
+
+        if (send_binary_msg(sock, RESOURCE_SERVER, CRUD_CREATE, ACK_REQUEST,
+                           0x00, &reg_payload, sizeof(RegisterPayload)) == 0) {
             char success_msg[128];
-            sprintf(success_msg, "[SUCCESS] Registered with Manager (%zd bytes sent)", sent);
+            sprintf(success_msg, "[SUCCESS] Sent REGISTER (Resource:0x%02X CRUD:0x%02X ACK:0x%02X)",
+                    RESOURCE_SERVER, CRUD_CREATE, ACK_REQUEST);
             safe_log(success_msg);
         } else {
             safe_log("[ERROR] Failed to send registration");
         }
-
 
         pthread_mutex_lock(&manager_mutex);
         manager_socket = sock;
@@ -181,12 +302,38 @@ void* manager_connection_thread(void* arg) {
 
         safe_log(">>> Manager connection established and active");
 
+        // Receive loop
+        GlobalHeader header;
+        uint8_t buffer[BUFFER_SIZE];
+        int result;
 
-        char buffer[BUFFER_SIZE];
-        while (recv(sock, buffer, BUFFER_SIZE, 0) > 0) {
-            // Manager might send commands here in the future
+        while ((result = recv_binary_msg(sock, &header, buffer, BUFFER_SIZE)) >= 0) {
+            log_header_info(&header);
+
+            uint8_t resource, crud, ack;
+            parse_msg_type(header.msg_type, &resource, &crud, &ack);
+
+            // Handle registration ACK
+            if (resource == RESOURCE_SERVER && crud == CRUD_CREATE && ack == ACK_RESPONSE) {
+                RegisterPayload *reg_ack = (RegisterPayload*)buffer;
+                my_server_id = reg_ack->server_id;
+
+                char ack_msg[128];
+                sprintf(ack_msg, "[MANAGER ACK] Registered! Assigned Server ID: 0x%02X",
+                        my_server_id);
+                safe_log(ack_msg);
+            }
+            // Handle activate server command
+            else if (resource == RESOURCE_ACTIVATE && crud == CRUD_CREATE && ack == ACK_REQUEST) {
+                ActivatePayload *activate = (ActivatePayload*)buffer;
+                safe_log("[MANAGER CMD] Received ACTIVATE command");
+
+                // Send ACK back
+                send_binary_msg(sock, RESOURCE_ACTIVATE, CRUD_CREATE, ACK_RESPONSE,
+                               0x00, activate, sizeof(ActivatePayload));
+                safe_log("[RESPONSE] Sent ACTIVATE ACK");
+            }
         }
-
 
         pthread_mutex_lock(&manager_mutex);
         manager_connected = 0;
@@ -207,7 +354,7 @@ void* manager_connection_thread(void* arg) {
     return NULL;
 }
 
-//Client management
+// Client management
 void manage_clients(int sock, int add) {
     pthread_mutex_lock(&clients_mutex);
     for (int i = 0; i < MAX_CLIENTS; i++) {
@@ -222,25 +369,7 @@ void manage_clients(int sock, int add) {
     pthread_mutex_unlock(&clients_mutex);
 }
 
-void broadcast(const char *msg, int sender_sock) {
-    pthread_mutex_lock(&clients_mutex);
-    int broadcast_count = 0;
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (client_sockets[i] != 0 && client_sockets[i] != sender_sock) {
-            send(client_sockets[i], msg, strlen(msg), 0);
-            broadcast_count++;
-        }
-    }
-    pthread_mutex_unlock(&clients_mutex);
-
-    if (broadcast_count > 0) {
-        char log_buf[128];
-        sprintf(log_buf, "[BROADCAST] Message sent to %d client(s)", broadcast_count);
-        safe_log(log_buf);
-    }
-}
-
-// handle client
+// Handle client
 void* handle_client(void* arg) {
     int sock = *(int*)arg;
 
@@ -251,35 +380,60 @@ void* handle_client(void* arg) {
     char connect_log[128];
     sprintf(connect_log, "[CLIENT CONNECT] %s:%d",
             inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
-    safe_log(connect_log);
+    log_and_forward(connect_log);
 
     manage_clients(sock, 1);
 
-    char buffer[BUFFER_SIZE];
-    char log_buf[BUFFER_SIZE + 100];
-    int n;
+    GlobalHeader header;
+    uint8_t buffer[BUFFER_SIZE];
+    int result;
 
-    while((n = recv(sock, buffer, BUFFER_SIZE - 1, 0)) > 0) {
-        buffer[n] = '\0';
+    while((result = recv_binary_msg(sock, &header, buffer, BUFFER_SIZE)) >= 0) {
+        uint8_t resource, crud, ack;
+        parse_msg_type(header.msg_type, &resource, &crud, &ack);
 
+        char log_buf[256];
+        sprintf(log_buf, "[CLIENT] %s:%d | Res:%d CRUD:%d ACK:%d Len:%d",
+                inet_ntoa(addr.sin_addr), ntohs(addr.sin_port),
+                resource, crud, ack, result);
+        log_and_forward(log_buf);
 
-        if (n > 0 && buffer[n-1] == '\n') buffer[n-1] = '\0';
-        if (n > 1 && buffer[n-2] == '\r') buffer[n-2] = '\0';
+        // Handle account creation
+        if (resource == RESOURCE_ACCOUNT && crud == CRUD_CREATE) {
+            AccountPayload *account = (AccountPayload*)buffer;
+            sprintf(log_buf, "[ACCOUNT CREATE] User: %.16s", account->username);
+            log_and_forward(log_buf);
 
-        sprintf(log_buf, "[CLIENT MESSAGE] %s:%d says: %s",
-                inet_ntoa(addr.sin_addr), ntohs(addr.sin_port), buffer);
-        safe_log(log_buf);
+            // Send ACK
+            send_binary_msg(sock, RESOURCE_ACCOUNT, CRUD_CREATE, ACK_RESPONSE,
+                           0x00, account, sizeof(AccountPayload));
+        }
+        // Handle login
+        else if (resource == RESOURCE_ACCOUNT && crud == CRUD_UPDATE &&
+                 ((AccountPayload*)buffer)->status == 0x01) {
+            AccountPayload *account = (AccountPayload*)buffer;
+            sprintf(log_buf, "[LOGIN] User: %.16s ID: 0x%02X",
+                    account->username, account->client_id);
+            log_and_forward(log_buf);
 
-
-        char broadcast_msg[BUFFER_SIZE + 50];
-        sprintf(broadcast_msg, "%s:%d> %s\n",
-                inet_ntoa(addr.sin_addr), ntohs(addr.sin_port), buffer);
-        broadcast(broadcast_msg, sock);
+            // Send ACK
+            send_binary_msg(sock, RESOURCE_ACCOUNT, CRUD_UPDATE, ACK_RESPONSE,
+                           0x00, account, sizeof(AccountPayload));
+        }
+        // Handle logout
+        else if (resource == RESOURCE_ACCOUNT && crud == CRUD_UPDATE &&
+                 ((AccountPayload*)buffer)->status == 0x00) {
+            AccountPayload *account = (AccountPayload*)buffer;
+            sprintf(log_buf, "[LOGOUT] User: %.16s ID: 0x%02X",
+                    account->username, account->client_id);
+            log_and_forward(log_buf);
+            break;
+        }
     }
 
     sprintf(connect_log, "[CLIENT DISCONNECT] %s:%d",
             inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
-    safe_log(connect_log);
+    log_and_forward(connect_log);
 
     manage_clients(sock, 0);
     close(sock);
@@ -287,27 +441,35 @@ void* handle_client(void* arg) {
     return NULL;
 }
 
-//main function
+// Main function
 int main(int argc, char *argv[]) {
     if (argc < 4) {
         printf("Usage: %s <My_Port> <Manager_IP> <Manager_Port>\n", argv[0]);
         printf("Example: %s 8080 127.0.0.1 9000\n", argv[0]);
+        printf("\nProtocol v0.1 (8-byte header):\n");
+        printf("  Byte 0: Version (4-bit major + 4-bit minor)\n");
+        printf("  Byte 1: Message Type (5-bit resource + 2-bit CRUD + 1-bit ACK)\n");
+        printf("  Byte 2: Status\n");
+        printf("  Byte 3: Padding\n");
+        printf("  Bytes 4-7: Message Length (network byte order)\n");
         return 1;
     }
 
     int my_port = atoi(argv[1]);
 
-
-    init_interface();
-    safe_log("===========================================");
-    safe_log("===     CHAT SERVER STARTING            ===");
-    safe_log("===========================================");
-
+    printf("===========================================\n");
+    printf("===  BINARY CHAT SERVER v0.1            ===\n");
+    printf("===  Protocol: 8-byte header             ===\n");
+    printf("===========================================\n");
 
     char startup_msg[128];
-    sprintf(startup_msg, ">>> Server Port: %d", my_port);
+    sprintf(startup_msg, "Server Port: %d", my_port);
     safe_log(startup_msg);
-    sprintf(startup_msg, ">>> Manager: %s:%s", argv[2], argv[3]);
+    sprintf(startup_msg, "Manager: %s:%s", argv[2], argv[3]);
+    safe_log(startup_msg);
+    sprintf(startup_msg, "Protocol Version: %d.%d", PROTOCOL_MAJOR, PROTOCOL_MINOR);
+    safe_log(startup_msg);
+    sprintf(startup_msg, "Header Size: %zu bytes", sizeof(GlobalHeader));
     safe_log(startup_msg);
 
     ManagerInfo *info = malloc(sizeof(ManagerInfo));
@@ -319,14 +481,12 @@ int main(int argc, char *argv[]) {
     pthread_create(&mgr_tid, NULL, manager_connection_thread, (void*)info);
     pthread_detach(mgr_tid);
 
-    //Setup Local Listening Socket
     safe_log("===========================================");
     safe_log(">>> Setting up server socket...");
 
     int srv_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (srv_fd < 0) {
         safe_log("[ERROR] Failed to create socket");
-        endwin();
         return 1;
     }
     safe_log(">>> Socket created successfully");
@@ -342,7 +502,6 @@ int main(int argc, char *argv[]) {
 
     if (bind(srv_fd, (struct sockaddr *)&srv_addr, sizeof(srv_addr)) < 0) {
         safe_log("[ERROR] Bind failed");
-        endwin();
         perror("Bind failed");
         return 1;
     }
@@ -350,23 +509,20 @@ int main(int argc, char *argv[]) {
 
     if (listen(srv_fd, 10) < 0) {
         safe_log("[ERROR] Listen failed");
-        endwin();
         perror("Listen failed");
         return 1;
     }
     safe_log(">>> Socket listening");
 
-    // Make accept non-blocking
     int flags = fcntl(srv_fd, F_GETFL, 0);
     fcntl(srv_fd, F_SETFL, flags | O_NONBLOCK);
 
     safe_log("===========================================");
-    sprintf(startup_msg, "=== SERVER ONLINE on port %d ===", my_port);
+    sprintf(startup_msg, "BINARY SERVER ONLINE on port %d", my_port);
     safe_log(startup_msg);
-    safe_log("=== Waiting for client connections... ===");
+    safe_log("Waiting for client connections...");
     safe_log("===========================================");
 
-    //Accept Loop
     while(1) {
         struct sockaddr_in c_addr;
         socklen_t c_len = sizeof(c_addr);
@@ -380,10 +536,8 @@ int main(int argc, char *argv[]) {
             pthread_detach(t);
         }
 
-        // UI refresh
         usleep(100000);
     }
 
-    endwin();
     return 0;
 }
