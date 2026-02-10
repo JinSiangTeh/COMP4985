@@ -1,9 +1,9 @@
 IP: 192.168.0.87
-Port: 9000
+Port: 9000 /8080 Not sure just try both
 
 
 How to compile:
-gcc main.c -o my_program -lncurses
+gcc main.c -o MyServer -lpthread -lncurses
 
 
 Command Line Argument:
