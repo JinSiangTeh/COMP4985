@@ -161,6 +161,46 @@ void client_log(const char *fmt, ...) {
     w_log_core(win_cli, buf); send_log_to_manager(buf);
 }
 
+
+uint32_t get_my_ip() {
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        perror("socket");
+        return 0;
+    }
+
+
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_port = htons(53),  // DNS port
+    };
+    inet_pton(AF_INET, "8.8.8.8", &addr.sin_addr);
+
+    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        perror("connect");
+        close(sock);
+        return 0;
+    }
+
+    // Get the local address that was selected
+    struct sockaddr_in local_addr;
+    socklen_t addr_len = sizeof(local_addr);
+    if (getsockname(sock, (struct sockaddr*)&local_addr, &addr_len) < 0) {
+        perror("getsockname");
+        close(sock);
+        return 0;
+    }
+
+    close(sock);
+
+    // Log the detected IP
+    char ip_str[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &local_addr.sin_addr, ip_str, sizeof(ip_str));
+    printf("Detected server IP: %s\n", ip_str);
+
+    return local_addr.sin_addr.s_addr;  // Already in network byte order
+}
+
 // thread
 
 void* manager_connection_thread(void* arg) {
@@ -173,24 +213,49 @@ void* manager_connection_thread(void* arg) {
 
         if (connect(sock, (struct sockaddr *)&mgr_addr, sizeof(mgr_addr)) == 0) {
             manager_log(">>> Connected to Manager!");
+
+            // Step 1: Register with manager
             RegisterPayload reg = { .server_id = my_server_id, .server_ip = my_server_ip };
             send_binary_msg(sock, RESOURCE_SERVER, CRUD_CREATE, ACK_REQUEST, 0x00, &reg, sizeof(reg));
 
             pthread_mutex_lock(&manager_mutex);
-            manager_socket = sock; manager_connected = 1;
+            manager_socket = sock;
+            manager_connected = 1;
             pthread_mutex_unlock(&manager_mutex);
 
-            GlobalHeader h; uint8_t buf[BUFFER_SIZE];
+            GlobalHeader h;
+            uint8_t buf[BUFFER_SIZE];
+
             while (recv_binary_msg(sock, &h, buf, BUFFER_SIZE) >= 0) {
-                uint8_t res, crud, ack; parse_msg_type(h.msg_type, &res, &crud, &ack);
-                if (res == RESOURCE_SERVER && ack == ACK_RESPONSE) {
+                uint8_t res, crud, ack;
+                parse_msg_type(h.msg_type, &res, &crud, &ack);
+
+                // Step 2: Receive server ID assignment
+                if (res == RESOURCE_SERVER && crud == CRUD_CREATE && ack == ACK_RESPONSE) {
                     my_server_id = ((RegisterPayload*)buf)->server_id;
                     manager_log("[ACK] Server ID assigned: 0x%02X", my_server_id);
                 }
+                // Step 3: Manager sends activation REQUEST - we must respond!
+                else if (res == RESOURCE_ACTIVATE && crud == CRUD_CREATE && ack == ACK_REQUEST) {
+                    manager_log("[ACTIVATE REQUEST] Manager requesting activation");
+
+                    // Respond with activation ACK
+                    RegisterPayload activate_response = {
+                        .server_id = my_server_id,
+                        .server_ip = my_server_ip
+                    };
+                    send_binary_msg(sock, RESOURCE_ACTIVATE, CRUD_CREATE, ACK_RESPONSE, 0x00,
+                                    &activate_response, sizeof(activate_response));
+                    manager_log("[ACTIVE] Sent activation response - Server is now ACTIVE!");
+                }
             }
         }
+
         manager_log("[ERR] Connection lost. Retrying in 5s...");
-        pthread_mutex_lock(&manager_mutex); manager_connected = 0; close(sock); pthread_mutex_unlock(&manager_mutex);
+        pthread_mutex_lock(&manager_mutex);
+        manager_connected = 0;
+        close(sock);
+        pthread_mutex_unlock(&manager_mutex);
         sleep(5);
     }
 }
@@ -274,6 +339,13 @@ void* handle_client(void* arg) {
 int main(int argc, char *argv[]) {
     if (argc < 4) { printf("Usage: %s <Port> <Mgr_IP> <Mgr_Port>\n", argv[0]); return 1; }
 
+    // Dynamically detect server IP BEFORE initializing ncurses
+    my_server_ip = get_my_ip();
+    if (my_server_ip == 0) {
+        fprintf(stderr, "ERROR: Could not detect server IP address!\n");
+        return 1;
+    }
+
     initscr(); start_color(); cbreak(); noecho(); curs_set(0);
     init_pair(1, COLOR_CYAN, COLOR_BLACK);
     int w = COLS / 3; int h = LINES - 2;
@@ -306,7 +378,7 @@ int main(int argc, char *argv[]) {
         struct sockaddr_in caddr; socklen_t clen = sizeof(caddr);
         int csock = accept(srv_fd, (struct sockaddr *)&caddr, &clen);
         if (csock >= 0) {
-            // Make client socket BLOCKING (accept inherits non-blocking from srv_fd)
+
             int flags = fcntl(csock, F_GETFL, 0);
             fcntl(csock, F_SETFL, flags & ~O_NONBLOCK);
 
