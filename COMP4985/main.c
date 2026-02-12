@@ -230,16 +230,16 @@ void* manager_connection_thread(void* arg) {
                 uint8_t res, crud, ack;
                 parse_msg_type(h.msg_type, &res, &crud, &ack);
 
-                // Step 2: Receive server ID assignment
+
                 if (res == RESOURCE_SERVER && crud == CRUD_CREATE && ack == ACK_RESPONSE) {
                     my_server_id = ((RegisterPayload*)buf)->server_id;
                     manager_log("[ACK] Server ID assigned: 0x%02X", my_server_id);
                 }
-                // Step 3: Manager sends activation REQUEST - we must respond!
+
                 else if (res == RESOURCE_ACTIVATE && crud == CRUD_CREATE && ack == ACK_REQUEST) {
                     manager_log("[ACTIVATE REQUEST] Manager requesting activation");
 
-                    // Respond with activation ACK
+
                     RegisterPayload activate_response = {
                         .server_id = my_server_id,
                         .server_ip = my_server_ip
