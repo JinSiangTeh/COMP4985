@@ -3,10 +3,10 @@ Port: 9000 /8080 Not sure just try both
 
 
 How to compile:
-gcc main.c -o MyServer -lpthread -lncurses
+Server: gcc -o server main.c -lpthread -lncurses
+Client: gcc -o client client.c -lpthread -lncurses
+
+Server: ./server <myport> <managerIP> <managerPort>
+Client: ./client <serverIP> <serverPort>
 
 
-Command Line Argument:
-myport: Your own port
-Manager_IP: server manager ip
-Manager Port: server manager port
