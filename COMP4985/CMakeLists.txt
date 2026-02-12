@@ -6,7 +6,8 @@ set(CMAKE_C_STANDARD 11)
 # 1. Look for the ncurses library on the system
 find_package(Curses REQUIRED)
 
-add_executable(untitled17 main.c)
+add_executable(untitled17 main.c
+        client.c)
 
 # 2. Link the ncurses library and pthreads to your executable
 target_link_libraries(untitled17 PRIVATE ${CURSES_LIBRARIES} pthread)

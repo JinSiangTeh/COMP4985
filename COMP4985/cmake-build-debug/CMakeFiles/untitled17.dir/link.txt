@@ -1,1 +1,1 @@
-/usr/bin/cc -g CMakeFiles/untitled17.dir/main.c.o -o untitled17  -lcurses /usr/lib/x86_64-linux-gnu/libform.so -lpthread 
+/opt/homebrew/opt/llvm/bin/clang -g -arch arm64 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/untitled17.dir/main.c.o CMakeFiles/untitled17.dir/client.c.o -o untitled17  /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/libcurses.tbd /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/libform.tbd -lpthread
