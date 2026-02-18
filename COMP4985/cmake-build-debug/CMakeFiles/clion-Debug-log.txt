@@ -1,0 +1,4 @@
+/Users/jinsiangteh/Desktop/CLion.app/Contents/bin/cmake/mac/aarch64/bin/cmake -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -G "Unix Makefiles" -S /Users/jinsiangteh/CLionProjects/COMP4985/COMP4985 -B /Users/jinsiangteh/CLionProjects/COMP4985/COMP4985/cmake-build-debug
+-- Configuring done (0.2s)
+-- Generating done (0.0s)
+-- Build files have been written to: /Users/jinsiangteh/CLionProjects/COMP4985/COMP4985/cmake-build-debug
