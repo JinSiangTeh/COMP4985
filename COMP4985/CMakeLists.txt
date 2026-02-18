@@ -8,7 +8,7 @@ find_package(Curses REQUIRED)
 
 add_executable(untitled17 main.c
         client.c
-        test.c)
+)
 
 # 2. Link the ncurses library and pthreads to your executable
 target_link_libraries(untitled17 PRIVATE ${CURSES_LIBRARIES} pthread)
